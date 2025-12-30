@@ -32,40 +32,46 @@ graph TD
 
 ### 2.2 Key Components
 
-1.  **EtcdServer (`server/v3/etcdserver`)**: The central hub. It handles client requests, interacts with the Raft node, and applies committed entries to the storage.
-2.  **Raft (`raft/v3`)**: The consensus module. It implements the Raft algorithm (leader election, log replication). It is designed as a pure state machine: it takes inputs (messages) and produces outputs (actions), but does not handle network IO or persistent storage directly.
-3.  **MVCC (`server/v3/storage/mvcc`)**: Multi-Version Concurrency Control storage. It presents a logical view of the key-value store where every modification increments a global revision. It handles key indexing (B-Tree in memory) and value storage (BoltDB on disk).
-4.  **WAL (`server/v3/storage/wal`)**: Write Ahead Log. Ensures durability by recording all changes before they are applied.
-5.  **Backend (`server/v3/storage/backend`)**: A wrapper around BoltDB (bbolt), providing transactional storage for the MVCC data.
+1.  **EtcdServer** (`vendor/go.etcd.io/etcd/server/v3/etcdserver/server.go`): The central hub. It handles client requests, interacts with the Raft node, and applies committed entries to the storage.
+2.  **Raft** (`vendor/go.etcd.io/raft/v3`): The consensus module. It implements the Raft algorithm (leader election, log replication). It is designed as a pure state machine: it takes inputs (messages) and produces outputs (actions), but does not handle network IO or persistent storage directly.
+3.  **MVCC** (`vendor/go.etcd.io/etcd/server/v3/storage/mvcc`): Multi-Version Concurrency Control storage. It presents a logical view of the key-value store where every modification increments a global revision. It handles key indexing (B-Tree in memory) and value storage (BoltDB on disk).
+4.  **WAL** (`vendor/go.etcd.io/etcd/server/v3/storage/wal`): Write Ahead Log. Ensures durability by recording all changes before they are applied.
+5.  **Backend** (`vendor/go.etcd.io/etcd/server/v3/storage/backend`): A wrapper around BoltDB (bbolt), providing transactional storage for the MVCC data.
 
 ## 3. Core Execution Flows
 
 ### 3.1 Bootstrapping
 
-1.  **Configuration**: `NewServer` is called with configuration (peers, data dir, timeouts).
-2.  **WAL Replay**: The server opens the WAL and reads all records (`WAL.ReadAll`). This restores the Raft HardState (term, vote, commit index) and the log entries.
-3.  **Snapshot Recovery**: If a snapshot exists, it is loaded to restore the application state (MVCC, cluster membership) to a specific point in time.
-4.  **Raft Start**: The `RaftNode` is initialized with the replayed log and state.
-5.  **Transport Start**: The `Rafthttp` transport is started to listen for peer connections.
+1.  **Configuration**: `NewServer` (in `etcdserver/server.go`) is called with configuration.
+2.  **WAL Replay**: The server opens the WAL and reads all records (`WAL.ReadAll`). This restores the Raft HardState and log entries.
+3.  **Snapshot Recovery**: If a snapshot exists, `snapshotter.Load` is called to restore the application state (MVCC, cluster membership).
+4.  **Raft Start**: The `RaftNode` is initialized with the replayed log and state (`raft.StartNode` or `raft.RestartNode`).
+5.  **Transport Start**: The `Rafthttp` transport is started (`rafthttp.Transport.Start`) to listen for peer connections.
 6.  **Loop**: The server enters its main run loop (`EtcdServer.run`), handling the `Ready` channel from Raft.
 
 ### 3.2 Write Path (Put Request)
 
 A client sends a `Put(key, value)` request.
 
+**Call Chain:**
+`EtcdServer.Put` -> `raftRequest` -> `processInternalRaftRequestOnce` -> `Raft.Propose` -> `raft.Step` -> `appendEntry`
+
 1.  **API Layer**: The gRPC handler receives the request.
-2.  **Proposal**: The handler calls `EtcdServer.Put`. The server checks quotas and calls `RaftNode.Propose`.
+2.  **Proposal**:
+    *   Code: `vendor/go.etcd.io/etcd/server/v3/etcdserver/v3_server.go` -> `Put`
+    *   The server checks quotas (`QuotaBackendBytes`).
+    *   Calls `s.r.Propose(cctx, data)`.
 3.  **Raft Consensus**:
-    *   The leader appends the entry to its log (unstable).
+    *   The leader appends the entry to its log (unstable) in `raft/raft.go`.
     *   The leader broadcasts `MsgApp` (AppendEntries) to followers.
     *   Followers append to their logs and respond with `MsgAppResp`.
     *   Once a quorum matches, the leader updates the `CommittedIndex`.
-4.  **Commit Notification**: The `Ready` channel notifies `EtcdServer` that new entries are committed.
+4.  **Commit Notification**: The `Ready` channel notifies `EtcdServer.run` loop.
 5.  **Application**:
-    *   `EtcdServer` calls `applyAll`.
+    *   `EtcdServer` calls `applyAll` (`etcdserver/server.go`).
     *   The entry is decoded.
-    *   `MVCC.Put` is called. It assigns a new revision, updates the in-memory B-Tree index, and writes the value to BoltDB.
-6.  **Response**: The server notifies the waiting request handler, which returns success to the client.
+    *   `MVCC.Put` (`storage/mvcc/kvstore_txn.go`) is called. It assigns a new revision, updates the in-memory B-Tree index, and writes the value to BoltDB.
+6.  **Response**: The server notifies the waiting request handler via `wait.Wait` (`w.Trigger`), which returns success to the client.
 
 ```mermaid
 sequenceDiagram
@@ -94,11 +100,17 @@ sequenceDiagram
 
 A client sends a `Range(key)` request.
 
-1.  **Linearizable Read**: Etcd guarantees linearizability. The leader must ensure it is still the leader and has the latest data.
-2.  **ReadIndex**: The server calls `RaftNode.ReadIndex`.
-3.  **Quorum Check**: The leader exchanges heartbeats with the quorum to confirm leadership.
-4.  **Wait**: The server waits until the `AppliedIndex` >= `ReadIndex`. This ensures the node has applied all data committed at the time the read started.
-5.  **MVCC Read**: `MVCC.Range` searches the in-memory B-Tree for the revision of the key, then fetches the value from BoltDB.
+**Call Chain:**
+`EtcdServer.Range` -> `linearizableReadNotify` -> `linearizableReadLoop` -> `requestCurrentIndex` -> `Raft.ReadIndex` -> `waitAppliedIndex` -> `MVCC.Range`
+
+1.  **Linearizable Read**:
+    *   Code: `vendor/go.etcd.io/etcd/server/v3/etcdserver/v3_server.go` -> `Range`
+    *   Calls `linearizableReadNotify` which signals the `linearizableReadLoop`.
+    *   The loop calls `requestCurrentIndex`.
+2.  **ReadIndex**: The server calls `RaftNode.ReadIndex` (`raft/node.go`).
+3.  **Quorum Check**: The leader exchanges heartbeats with the quorum to confirm leadership (part of Raft's `ReadIndex` handling in `raft/raft.go`).
+4.  **Wait**: The server waits in `waitAppliedIndex` until the `AppliedIndex` >= `ReadIndex`. This ensures the node has applied all data committed at the time the read started.
+5.  **MVCC Read**: `MVCC.Range` (`storage/mvcc/kvstore_txn.go`) searches the in-memory B-Tree for the revision of the key, then fetches the value from BoltDB.
 
 ```mermaid
 sequenceDiagram
@@ -261,7 +273,68 @@ type KeyValue struct {
 }
 ```
 
-## 9. Teaching Mode: Simplified Explanation
+## 9. Real-World Failure Edge Cases
+
+### 9.1 Split Brain & Network Partitions
+*   **Scenario**: The cluster is partitioned into two groups (e.g., 2 nodes and 3 nodes in a 5-node cluster).
+*   **Mechanism**: `CheckQuorum` (in `raft/raft.go`).
+*   **Behavior**:
+    *   The leader in the minority partition fails to receive `MsgHeartbeatResp` from a quorum.
+    *   It steps down to `StateFollower`.
+    *   It cannot commit new entries.
+    *   Clients connected to the minority partition will see timeouts for writes. Reads may be stale unless `Linearizable` (which forces a quorum check).
+*   **Risk**: If linearizability is disabled, stale reads are possible. Writes are safe (blocked).
+
+### 9.2 Slow Followers
+*   **Scenario**: A follower has high network latency or slow disk I/O.
+*   **Mechanism**: Flow Control (`raft/tracker/inflights.go`).
+*   **Behavior**:
+    *   The leader tracks `Inflights` (unacknowledged messages).
+    *   If `MaxInflightMsgs` is reached, the leader stops sending `MsgApp` optimistically.
+    *   It enters a `Probe` state, sending one message at a time until the follower catches up.
+*   **Risk**: A single slow follower does not block the cluster (unless it prevents a quorum). However, it increases the risk of data loss if the leader crashes (reduced replication factor).
+
+### 9.3 Disk Latency Spikes (fsync)
+*   **Scenario**: The `WAL` sync takes seconds due to noisy neighbors or disk failure.
+*   **Mechanism**: `wal/wal.go` -> `sync()`.
+*   **Behavior**:
+    *   The Raft loop blocks on `wal.Save`.
+    *   Heartbeats are delayed.
+    *   Peers may time out and trigger an election (`MsgHup`).
+*   **Handling**: Etcd logs a warning ("slow fdatasync").
+*   **Risk**: Cluster instability and frequent leader elections.
+
+### 9.4 Extremely Large Writes
+*   **Scenario**: A client tries to put a 100MB value.
+*   **Mechanism**: `MaxRequestBytes` check (`etcdserver/server.go`).
+*   **Behavior**:
+    *   The proposal is rejected immediately with `ErrRequestTooLarge`.
+    *   If a large write slips through (e.g., barely under limit but many of them), it blocks the Raft loop during serialization and WAL write.
+    *   This blocks heartbeats.
+*   **Risk**: Leader instability.
+
+### 9.5 Delayed Snapshot Catch-Up
+*   **Scenario**: A new node joins or a node recovers after a long downtime.
+*   **Mechanism**: `MsgSnap` (`raft/raft.go`).
+*   **Behavior**:
+    *   The leader detects the follower is too far behind (log compacted).
+    *   It sends a snapshot.
+    *   The follower must receive, save, and apply the snapshot. This is expensive.
+    *   During this time, the follower is effectively offline.
+*   **Risk**: If the transfer takes longer than `ElectionTimeout`, the follower might disrupt the cluster by starting elections. Etcd mitigates this with `SnapshotTemporarilyUnavailable`.
+
+### 9.6 Compaction & Watcher Interactions
+*   **Scenario**: A client watches a key starting from revision 1000 (`Watch(key, startRev=1000)`). The cluster compacts history up to revision 2000.
+*   **Mechanism**: `Compaction` (in `mvcc/kvstore_compaction.go`) and `WatchResponse.CompactRevision` (in `mvcc/watcher.go`).
+*   **Behavior**:
+    1.  The periodic compactor triggers.
+    2.  `store.Compact(2000)` removes revisions < 2000 from the BoltDB and in-memory index.
+    3.  The watch subsystem detects that the watcher's `startRev` (1000) is now lost.
+    4.  It sends a `WatchResponse` with `CompactRevision` set to 2000 and `Canceled` set to true.
+*   **Client Impact**: The client receives `ErrCompacted` (specifically "mvcc: required revision has been compacted").
+*   **Recovery**: The client *must* restart the watch. Since history is gone, it typically performs a fresh `Range` (Get) to get the current state and then starts watching from `currentRev + 1`. This creates a window where events *could* be missed if not handled atomically (though usually acceptable for eventual consistency).
+
+## 10. Teaching Mode: Simplified Explanation
 
 Imagine a distributed notebook shared by a group of friends (Nodes).
 
